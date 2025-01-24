@@ -1,0 +1,16 @@
+from google.colab import files
+files.upload()
+
+!rm -r ~/.kaggle
+!mkdir ~/.kaggle
+!mv ./kaggle.json ~/.kaggle/
+!chmod 600 ~/.kaggle/kaggle.json
+
+!kaggle datasets download -d mohamedbakhet/amazon-books-reviews
+!kaggle datasets download "mohamedbakhet/amazon-books-reviews" -p /content/sample_data/ --unzip
+
+!pip install torch torchvision torchaudio
+!pip install openai
+
+!pip install umap-learn hdbscan
+!pip install torch torchvision torchaudio
