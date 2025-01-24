@@ -1,0 +1,261 @@
+import pandas as pd
+import requests
+
+import os
+from openai import OpenAI
+
+import torch
+from transformers import BertTokenizer, BertModel
+import torch.nn.functional as f
+
+import numpy as np
+import re
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+
+import umap
+import hdbscan
+from sklearn.metrics import pairwise_distances
+import json
+
+import pickle
+import torch
+
+df = pd.read_csv('/content/sample_data/Books_rating.csv')
+df = df[["Id", "Title", "User_id", "review/score", "review/summary", "review/text"]]
+dict = {}
+for elem in df.iterrows():
+  if elem[1]["Id"] not in dict:
+    dict[elem[1]["Id"]] = elem[1]["Title"]
+  if len(dict) == 1000:
+    break
+#need to incorporate those with learning disabiltiies into the dataset
+#Next Steps: produce clusters based on the books they've reviewed via the book's plot, the score given, their review summary and actual text
+
+#using OpenAI API to find summary of every book in the list
+client = OpenAI(api_key="replace with actual key")
+def get_completion(prompt, model="gpt-3.5-turbo"):
+    messages = [{"role": "user", "content": prompt}]
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0, # this is the degree of randomness of the model's output
+    )
+    return response.choices[0].message.content
+#add examples for each of the points and a few full rewrite examples, add steps (focus on spacing)
+book_title_and_plot = {}
+for elem in dict:
+  prompt = f"This is the book's title: {dict[elem]}, give a short summary of the book's plot. 30 words max."
+  response = get_completion(prompt)
+  book_title_and_plot[dict[elem]] = response
+  print(len(book_title_and_plot))
+
+df = pd.DataFrame(book_title_and_plot.items(), columns=['Title', 'Plot'])
+df.to_csv('book_title_and_plot.csv', index=False)
+
+df = pd.read_csv('book_title_and_plot.csv')
+df.head()
+
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+model = BertModel.from_pretrained('bert-base-uncased')
+device = torch.device('cpu')
+
+def get_encoding_batch(sequence, batch_size=100):
+  encodings = []
+  count = 0
+  for i in range(0, len(sequence), batch_size):
+    batch = sequence[i:i+batch_size]
+    encoded = tokenizer(batch, padding=True, return_tensors="pt")
+    size = 79
+    for elem in encoded:
+      padding = torch.zeros(encoded[elem].shape[0], size - encoded[elem].shape[1], dtype = torch.long)
+      encoded[elem] = torch.cat((encoded[elem], padding), dim=1)
+    encoded = encoded.to(device)
+    with torch.no_grad():
+      encoded = model(**encoded)
+    print(encoded[0].shape)
+    encodings.extend(encoded[0])
+    count += 1
+    print(count)
+  return encodings
+
+plot_list = df['Plot'].tolist()
+plot_list = get_encoding_batch(plot_list)
+df['Encodings'] = [torch.tensor(encoding) for encoding in plot_list]
+
+encoding = [torch.mean(elem, dim=0).numpy() for elem in df['Encodings']]
+df['encodings'] = encoding
+
+#reduce dimensionality to 50
+umap_reducer = umap.UMAP(n_components=50, random_state=42)
+encodings = umap_reducer.fit_transform(encoding)
+
+#cluster with hdbscan using euclidean distance
+
+cosine_distances = pairwise_distances(encodings, metric='cosine')
+cosine_distances = cosine_distances.astype(np.float64)
+clusterer = hdbscan.HDBSCAN(metric='precomputed', min_cluster_size=15, min_samples=1)
+labels = clusterer.fit_predict(cosine_distances)
+
+df['clusters'] = labels
+df.drop('Encodings', axis=1, inplace=True)
+df.drop('encodings', axis=1, inplace=True)
+
+endpoint_watson = "https://api.us-south.natural-language-understanding.watson.cloud.ibm.com/instances/3d4468af-8ad0-4453-9535-72f90c9eb5c4/v1/analyze"
+params = {
+    'version' : '2022-04-07'
+}
+headers = {
+    'Content-Type': 'application/json'
+}
+username = "apikey"
+password = "-OwF1ab-S1ekafX-ps_dSnaFE_Q0eYBf9wtTdcVV2x0B"
+
+def get_concepts_and_keywords(text):
+  watson_data_options = {
+      "text": text,
+      "features": {
+          "concepts": {
+              "limit": 15
+          },
+          "keywords": {
+              "limit": 15
+          }
+      }
+  }
+  resp = requests.post(endpoint_watson,
+                         data=json.dumps(watson_data_options),
+                         headers=headers,
+                         params=params,
+                         auth=(username, password))
+  return resp.json()
+
+def get_emotion(text, string_list):
+  watson_data_options = {
+      "text": text,
+      "features": {
+          "emotion": {
+              "targets": string_list
+          }
+      }
+  }
+  resp = requests.post(endpoint_watson,
+                         data=json.dumps(watson_data_options),
+                         headers=headers,
+                         params=params,
+                         auth=(username, password))
+  return resp.json()
+cluster_summaries = {}
+for i in range(1, df['clusters'].max() + 1):
+  rows = df.loc[df['clusters'] == i]
+  cluster_summaries[tuple(rows['Title'].tolist())] = ""
+  description = ' '.join(rows['Plot'].tolist())
+  broad_topics = get_concepts_and_keywords(description)
+  concepts = []
+  keywords = []
+  for elem in broad_topics["concepts"]:
+    if elem["relevance"] >= 0.9:
+      concepts.append(elem["text"])
+  for elem in broad_topics["keywords"]:
+    if elem["relevance"] >= 0.57:
+      keywords.append(elem["text"])
+
+  emotions = get_emotion(description, keywords)
+  document_level = emotions['emotion']['document']['emotion']
+  emotion_list = [max(document_level, key=document_level.get)]
+  for elem in emotions['emotion']['targets']:
+    keyword_level = elem['emotion']
+    if max(keyword_level, key=keyword_level.get) not in emotion_list:
+      emotion_list.append(max(keyword_level, key=keyword_level.get))
+  cluster_summaries[tuple(rows['Title'].tolist())] = f"Emotions explored are: {', '.join(emotion_list)}. General concepts are: {', '.join(concepts)}."
+  print(len(cluster_summaries))
+
+cluster_summaries_df = pd.read_csv("cluster_summaries.csv")
+cluster_summaries_df.head()
+plot_list = get_encoding_batch(cluster_summaries_df['Summary'].tolist())
+cluster_summaries_df['Encodings'] = [torch.tensor(encoding) for encoding in plot_list]
+cluster_summaries_df.to_pickle('cluster_summaries_encoded.pkl')
+                                     
+find_book_plot = {"Dr. Seuss: American Icon": None, "Wonderful Worship in Smaller Churches": None, "Make the Season Bright": None, "The Grey Wolf": None, "Model Home": None, "Absolution": None, "The Brightness Between Us": None, "Sixteen Minutes": None, "The Mystery Guest": None, "Wonder": None, "1984": None, "The Kite Runner": None, "Nation Dance: Religion, Identity and Cultural Difference in the Caribbean": None, "Its Only Art If Its Well Hung!": None, "Whispers of the Wicked Saints": None}
+personas = {"Sarah Mayor Cox": "The reader rated the book, 'Dr. Seuss: American Icon' a 4/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: This is an absolutely fascinating book. Nel is a fabulous example of an academic who knows how to write in a way that draws you into his ideas - rather than someone who makes you feel stupid because you can't understand his ideas. Many Westerners have grown up reading Suess when they are young and for anyone who has this will be a really insightful and thought-provoking book.",
+            "Klaus Mikaelson": "The reader rated the book, 'Wonderful Worship in Smaller Churches' a 4/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: Not so much a revelation but an affirmation of the creative approach many of our small churches take toward worship.",
+            "Bonnie Bennett": "The reader rated the book, 'Make the Season Bright' a 2/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: I don't know ya'll. I feel like a second-chance romance is a hard sell and I just wasn't rooting for these two to get back together. Your mileage may vary, but I think it was for the best that they broke up and have been living different lives. I requested this because I LOVED the Bright Falls series and I generally like a holiday romance. I did not read the description, so part of that is on me.",
+            "Elena Gilbert": "The reader rated the book, 'The Grey Wolf' a 4/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: Gamache suspects something is amiss when he gets a call from an old enemy. His pied a terre is broken into, and for some reason his coat is taken. Could someone really be plotting to poison the water in Montreal? Why is no one doing anything? Could the plot come from the highest offices in Ottawa? Terrorists? The Surete itself? Who can Gamache trust besides Jean-Guy and Isabelle? What is the relationship to an isolated monastery which got its name from the legend of the two wolves. (Each person “has two wolves inside. One of them, a grey wolf, wanted us to be strong and compassionate, wise and courageous enough to be forgiving. The other, a black wolf, wanted us to be vengeful. To forget no wrong. To forgive no slight, To attack first. To be cruel and cunning and brutal to friends and enemies alike. To spare no one.” Which wolf will win? The one that we feed). To stop this plot, the black wolf people, Gamache and his team travel far and wide to find the evidence they need. This is an edge of your seat thriller with not many of our Three Pines friends, and this is the first time I’ve seen a cliffhanger ending in Louise Penny’s books. Thanks to the publisher and Edelweiss for the ARC.",
+            "Damon Salvatore": "The reader rated the book, 'Model Home' a 4/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: This is my first time reading from Rivers Solomon and it won’t be the last. Their prose was excellent. Very clear and thoughtful decisions on a sentence level that contributed to an overall very engaging storytelling experience. On top of that, there are so many layers to this story thematically—of gender, parents vs. children, race, identity and more—that take this beyond just a haunted house story. My only complaint is the ending and resolution felt a bit abrupt. I would’ve liked a bit more time at the climax of the story to explore the fallout, especially the inner thoughts of our main character. It was quite short for something with so much build up (which I did enjoy).",
+            "Gyalten Lekden": "The reader rated the book, 'Absolution' a 5/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: You don’t know what you think you know. Or, rather, what you know is only the mere apparition of something else, something more natural and abundant that dwells on the other side of your meager perception. This book wants you to look at yourself, your ideologies and definitions, and reconsider not just their authenticity and provenance but also their utility. Do they bring you closer to a type of truth, or do they use dividing lines to magnify distinctions?",
+            "Johnee": "The reader rated the book, 'The Brightness Between Us' a 5/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: The Brightness Between Us is the sequel to The Darkness Outside Us, and I am enamored. As usual, I finished the book at an ungodly hour at 1am last night, tears flowing down my face as I was rapt with all the emotions. It’s easy for me to say that I absolutely loved it and is very worthy of a 5 star rating. The story itself feels like the perfect continuation of the first book, building on the blocks we already established, whilst also providing a fresh, exhilarating, intriguing, and exciting storyline that also interweaves with the first book. It’s so very well done and I applaud Eliot on his ability to have created a sequel that achieves this. It’s not easy for a sequel to do just as well, so I think all of the elements he had were the perfect combination. I really enjoy Eliot's writing, he makes the story so consumable, making you hungry for more. I think the pacing is medium, and really picks up near the end, which is where you want it because it just elevates your emotions and reactions to what's happening.",
+            "Laura": "The reader rated the book, 'Sixteen Minutes' a 3/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: What would you do……….if you found out someone you love would die within days? What would you do if you found out there was a way to save them? And what would you do if you discovered the world you lived in wasn’t what it appeared to be? Sixteen Minutes explores all those questions, more than those and much more to consider. It is a work of fiction, however, who knows if elements exist in our world today. Four stars for this unusual YA novel that makes you truly question how you would react and what would you do….",
+            "Beti Zenova": "The reader rated the book, 'The Mystery Guest' a 4/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: Nita Prose has crafted a character who truly resonates with me. I can hear her voice in my mind, understand her, and root for her on every page. She strives for perfection, even though she knows it’s an incredibly high bar to reach. Having faced her own struggles, she is remarkably in tune with the flaws, problems, and challenges of others. I adore this character, with complete admiration. In this sequel, Prose has developed Molly’s character even further since her debut four years ago. Molly shows us that she started at the bottom and is steadily rising. Go, Molly! She’s an employee who maintains an attitude of gratitude, and her ability to read people has sharpened, thanks to her unique way of noticing details others might overlook. Her self-awareness, both of her shortcomings and strengths, is refreshingly simple yet profound.",
+            "Janina": "The reader rated the book, 'Wonder' a 2/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: I feel a bit like a cold-hearted snob for giving this book two stars. I am not saying that it isn't an uplifting story definitely worth being told (and read), but I can't deny that there were a few aspects I had problems with and that the story didn't trigger the emotional reaction I expected it to.",
+            "Emily May": "The reader rated the book, '1984' a 5/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: This was the book that started my love affair with the dystopian genre. And maybe indirectly influenced my decision to do a politics degree. I was only 12 years old when I first read it but I suddenly saw how politics could be taken and manipulated to tell one hell of a scary and convincing story. I'm a lot more well-read now but, back then, this was a game-changer. I started to think about things differently. I started to think about 2 + 2 = 5 and I wanted to read more books that explored the idea of control.",
+            "Lena": "The reader rated the book, 'The Kite Runner' a 4/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: I knew that the book about Afghanistan would be painful to read yet still I'm devastated. The story shows us the deeper understanding of the country's tragedy: generations of tortured and raped orphans, exultation of cruelty and triumph of psychopaths. And it was even more hardly for me to read the story of immigrants, cos I keep recognizing myself and other Ukrainians in them.",
+            "Sophia Zhang": "The reader rated the book, 'Nation Dance: Religion, Identity and Cultural Difference in the Caribbean' a 4/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: This is an important read for anyone interested in how religion and culture intertwine to shape identities! Though academic in tone, it’s a valuable resource for understanding diversity and the complexity of cultural heritage.",
+            "Ethan Patel": "The reader rated the book, 'Its Only Art If Its Well Hung!' a 2/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: The title intrigued me, but the content fell flat…. The book lacks depth and feels more like a gimmick than a serious exploration of art. Some humor lands, but it’s not enough to carry the entire read.",
+            "Oliver Bennet": "The reader rated the book, 'Whispers of the Wicked Saints' a 3/5. Ratings go from 1 (the worst) to 5 (the best) on this scale. This is their review of it: A gripping premise that promises mystery and intrigue, but the execution left me wanting more depth… The story follows Julia Thomas as she confronts twists that pull her life into chaos. It’s an engaging read, but I found the pacing uneven and some characters underdeveloped."}
+
+book_title_and_plot_search = pd.read_csv('book_title_and_plot.csv')
+count = 0
+for index, row in book_title_and_plot_search.iterrows():
+  if row['Title'] in find_book_plot:
+    find_book_plot[row['Title']] = row['Plot']
+    count += 1
+  if count == len(find_book_plot):
+    break
+for elem in find_book_plot:
+  print(find_book_plot[elem])
+                                     
+for user in personas:
+  start = personas[user].find("'") + 1
+  end = personas[user].find("'", start)
+  book_title = personas[user][start: end]
+  if find_book_plot[book_title] != None:
+    print("hello")
+    personas[user] = personas[user][:personas[user].find(".", end) + 1] + " This is the book's summary: " + find_book_plot[book_title] + personas[user][personas[user].find(".") + 1:]
+
+def user_encoding(sequence, batch_size=100):
+  encodings = []
+  for i in range(0, len(sequence), batch_size):
+    batch = sequence[i:i+batch_size]
+    encoded = tokenizer(batch, padding='max_length', max_length= 79, truncation = True, return_tensors="pt")
+    encoded = encoded.to(device)
+    with torch.no_grad():
+      encoded = model(**encoded)
+    print(encoded[0].shape)
+    encodings.extend(encoded[0])
+  return encodings
+
+users = []
+user_review = []
+for user in personas:
+  users.append(user)
+  user_review.append(personas[user])
+user_review = user_encoding(user_review)
+user_review = [torch.tensor(encoding) for encoding in user_review]
+
+personas = {}
+for i in range(len(users)):
+  personas[users[i]] = user_review[i]
+user_review = pd.DataFrame({'Users': users, 'Encodings': user_review})
+user_review.to_pickle('user_review.pkl')
+
+#cosine similarity with user reviews and cluster summaries encodings
+
+with open('user_review.pkl', 'rb') as f:
+    user_review = pickle.load(f)
+with open('cluster_summaries_encoded.pkl', 'rb') as f:
+    cluster_summaries = pickle.load(f)
+cluster_by_user = []
+for user_ind, user in user_review.iterrows():
+  score = -2
+  user_cluster = None
+  for cluster_ind, cluster in cluster_summaries.iterrows():
+    if torch.cosine_similarity((user['Encodings'].mean(axis=0)).reshape(1,-1), (cluster['Encodings'].mean(axis=0)).reshape(1,-1)) > score:
+      score = torch.cosine_similarity((user['Encodings'].mean(axis=0)).reshape(1,-1), (cluster['Encodings'].mean(axis=0)).reshape(1,-1))
+      user_cluster = cluster['Cluster']
+  cluster_by_user.append(user_cluster)
+for elem in cluster_by_user:
+  print(elem)
+
+user_review['Cluster'] = cluster_by_user
+user_review.to_pickle('user_review.pkl')
